@@ -95,7 +95,6 @@ impl Runner {
         let mut s = self.state.lock().await;
         s.python_path = p.clone();
         s.python_detected = true;
-        tracing::info!("已检测到Python: {p}");
         p
     }
 
@@ -109,7 +108,6 @@ impl Runner {
         let mut s = self.state.lock().await;
         s.golang_path = p.clone();
         s.golang_detected = true;
-        tracing::info!("已检测到Golang: {p}");
         p
     }
 
@@ -123,7 +121,6 @@ impl Runner {
         let mut s = self.state.lock().await;
         s.bun_path = p.clone();
         s.bun_detected = true;
-        tracing::info!("已检测到Bun: {p}");
         p
     }
 
@@ -139,7 +136,6 @@ impl Runner {
                 this.check_state().await;
             }
         });
-        tracing::info!("Python运行器已启动");
     }
 
     async fn check_state(self: &Arc<Self>) {
@@ -233,6 +229,18 @@ impl Runner {
             s.run_start_time = now_millis();
             s.run_code = code.clone();
             s.run_has_go_blocks = false;
+        }
+
+        if let Some(novel) = super::exec_novel::parse_novel(&code) {
+            self.webtty
+                .lock()
+                .await
+                .send_msg(&WsCmd::BackendEvent {
+                    data: "\x1b[3J\x1b[H\x1b[2J".into(),
+                })
+                .await;
+            self.run_novel(novel).await;
+            return;
         }
 
         let run_id = gen_id();

@@ -91,7 +91,6 @@ pub async fn warmup_runtimes(state: Arc<Mutex<RunnerState>>) {
             .output(),
     )
     .await;
-    tracing::info!("Python 预热完成: {py}");
 
     let go = find_golang_path().await;
     {
@@ -104,7 +103,6 @@ pub async fn warmup_runtimes(state: Arc<Mutex<RunnerState>>) {
         tokio::process::Command::new(&go).arg("version").output(),
     )
     .await;
-    tracing::info!("Golang 预热完成: {go}");
 
     let bun = find_bun_path().await;
     {
@@ -117,5 +115,4 @@ pub async fn warmup_runtimes(state: Arc<Mutex<RunnerState>>) {
         tokio::process::Command::new(&bun).arg("--version").output(),
     )
     .await;
-    tracing::info!("Bun 预热完成: {bun}");
 }

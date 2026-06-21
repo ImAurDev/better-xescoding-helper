@@ -18,18 +18,18 @@ use config::PORT_PAIRS;
 use history::HistoryStore;
 use http::port::is_port_available;
 use http::router;
-use python::lib_list::{run_auto_state, PackageList};
+use python::lib_list::{PackageList, run_auto_state};
 use python::package_manager::PackageManager;
 use python::runner::Runner;
 use state::{AppState, ServerError};
 use utils::cache_cleaner;
 use websocket::webtty::Webtty;
-use websocket::{build_router, WsState};
+use websocket::{WsState, build_router};
 
 #[tokio::main]
 async fn main() {
     logger::init();
-    tracing::info!("欢迎使用 更好的学而思编程助手 v1 | 作者: 极光");
+    tracing::info!("欢迎使用 更好的学而思编程助手 v2 | 作者: 极光");
 
     cache_cleaner::start();
 
@@ -109,14 +109,10 @@ async fn main() {
     let go_result = detect_golang().await;
     let bun_result = detect_bun().await;
 
-    if let Some(p) = go_result {
-        tracing::info!("Golang 可用: path={p}");
-    } else {
+    if go_result.is_none() {
         tracing::warn!("Golang 未检测到");
     }
-    if let Some(p) = bun_result {
-        tracing::info!("Bun 可用: path={p}");
-    } else {
+    if bun_result.is_none() {
         tracing::warn!("Bun 未检测到");
     }
 

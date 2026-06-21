@@ -98,6 +98,9 @@ pub struct Webtty {
     pub(crate) danger_buf: String,
     pub(crate) terminal_cols: u16,
     pub(crate) terminal_rows: u16,
+    pub(crate) resize_notify: Arc<tokio::sync::Notify>,
+    raw_mode: bool,
+    escape_buf: String,
 }
 
 impl Webtty {
@@ -121,6 +124,9 @@ impl Webtty {
             danger_buf: String::new(),
             terminal_cols: 80,
             terminal_rows: 24,
+            resize_notify: Arc::new(tokio::sync::Notify::new()),
+            raw_mode: false,
+            escape_buf: String::new(),
         }
     }
 
@@ -165,15 +171,21 @@ impl Webtty {
                         return MsgAction::None;
                     }
                 };
+                let mut resized = false;
                 if let Some(c) = data.cols.as_ref().and_then(|s| s.parse::<u16>().ok()) {
-                    if c >= 20 && c <= 1000 {
+                    if (20..=1000).contains(&c) && c != self.terminal_cols {
                         self.terminal_cols = c;
+                        resized = true;
                     }
                 }
                 if let Some(r) = data.rows.as_ref().and_then(|s| s.parse::<u16>().ok()) {
-                    if r >= 5 && r <= 200 {
+                    if (5..=200).contains(&r) && r != self.terminal_rows {
                         self.terminal_rows = r;
+                        resized = true;
                     }
+                }
+                if resized {
+                    self.resize_notify.notify_waiters();
                 }
                 if data.msg_type.as_deref() == Some("assets") {
                     return MsgAction::HandleAssets(asset_json_from(data));
@@ -197,9 +209,53 @@ impl Webtty {
                 }
                 MsgAction::None
             }
+            Some('3') => {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(rest) {
+                    let mut resized = false;
+                    if let Some(c) = value.get("columns").and_then(|v| v.as_u64()) {
+                        let c = c as u16;
+                        if (20..=1000).contains(&c) && c != self.terminal_cols {
+                            self.terminal_cols = c;
+                            resized = true;
+                        }
+                    } else if let Some(c) = value.get("cols").and_then(|v| v.as_u64()) {
+                        let c = c as u16;
+                        if (20..=1000).contains(&c) && c != self.terminal_cols {
+                            self.terminal_cols = c;
+                            resized = true;
+                        }
+                    }
+                    if let Some(r) = value.get("rows").and_then(|v| v.as_u64()) {
+                        let r = r as u16;
+                        if (5..=200).contains(&r) && r != self.terminal_rows {
+                            self.terminal_rows = r;
+                            resized = true;
+                        }
+                    }
+                    if resized {
+                        self.resize_notify.notify_waiters();
+                    }
+                }
+                MsgAction::None
+            }
             Some('1') if self.state == State::Ready => {
                 if self.client_id == client_id {
+                    if !self.escape_buf.is_empty() {
+                        self.escape_buf.push_str(rest);
+                        let last = self.escape_buf.chars().last();
+                        if let Some(c) = last {
+                            if c.is_ascii_alphabetic() || c == '~' {
+                                let seq = std::mem::take(&mut self.escape_buf);
+                                self.inputs.push_back(seq);
+                            }
+                        }
+                        return MsgAction::None;
+                    }
                     if rest == "\r" || rest == "\n" {
+                        if !self.escape_buf.is_empty() {
+                            let seq = std::mem::take(&mut self.escape_buf);
+                            self.inputs.push_back(seq);
+                        }
                         let whole: String = self.tmp_inputs.concat();
                         self.inputs.push_back(whole);
                         self.tmp_inputs.clear();
@@ -208,6 +264,13 @@ impl Webtty {
                         if let Some(last) = self.tmp_inputs.pop() {
                             let is_ch = is_chinese(&last);
                             self.send_mv_msg(is_ch).await;
+                        }
+                    } else if self.raw_mode && self.tmp_inputs.is_empty() {
+                        if rest == "\x1b" {
+                            self.escape_buf = "\x1b".to_string();
+                        } else {
+                            self.inputs.push_back(rest.to_string());
+                            self.send_to_web("1", rest).await;
                         }
                     } else {
                         for ch in rest.chars() {
@@ -343,6 +406,10 @@ impl Webtty {
 
     pub fn fetch_next_input(&mut self) -> Option<String> {
         self.inputs.pop_front()
+    }
+
+    pub fn set_raw_mode(&mut self, raw: bool) {
+        self.raw_mode = raw;
     }
 
     pub fn state_to_wait(&mut self) {
