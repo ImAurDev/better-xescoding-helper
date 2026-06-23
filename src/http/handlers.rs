@@ -248,7 +248,7 @@ pub async fn choose_mirror(
 
 pub async fn get_history(State(app): State<AppState>) -> Response {
     let h = app.history.lock().await;
-    let records = h.list();
+    let records = h.list().await;
     Json(json!({ "records": records })).into_response()
 }
 

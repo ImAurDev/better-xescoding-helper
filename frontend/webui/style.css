@@ -1,0 +1,73 @@
+@import "tailwindcss";
+
+@theme {
+    --color-ink: var(--c-ink);
+    --color-canvas: var(--c-canvas);
+    --color-canvas-soft: var(--c-canvas-soft);
+    --color-hairline: var(--c-hairline);
+    --color-accents-2: var(--c-accents-2);
+    --color-accents-4: var(--c-accents-4);
+    --color-accents-5: var(--c-accents-5);
+    --color-accents-6: var(--c-accents-6);
+    --color-accents-7: var(--c-accents-7);
+    --color-success-bg: var(--c-success-bg);
+    --color-success-border: var(--c-success-border);
+    --color-success-text: var(--c-success-text);
+    --color-error-bg: var(--c-error-bg);
+    --color-error-border: var(--c-error-border);
+    --color-error-text: var(--c-error-text);
+    --color-warning-bg: var(--c-warning-bg);
+    --color-warning-border: var(--c-warning-border);
+    --color-warning-text: var(--c-warning-text);
+    --color-go-tag: var(--c-go-tag);
+    --color-ts-tag: var(--c-ts-tag);
+    --color-stderr: var(--c-stderr);
+}
+
+:root {
+    --c-ink: #171717;
+    --c-canvas: #ffffff;
+    --c-canvas-soft: #fafafa;
+    --c-hairline: #ebebeb;
+    --c-accents-2: #eaeaea;
+    --c-accents-4: #d4d4d4;
+    --c-accents-5: #999;
+    --c-accents-6: #666;
+    --c-accents-7: #444;
+    --c-success-bg: #f0f7ff;
+    --c-success-border: #d3e5ff;
+    --c-success-text: #0070f3;
+    --c-error-bg: #fef2f2;
+    --c-error-border: #fecaca;
+    --c-error-text: #e00;
+    --c-warning-bg: #fffbeb;
+    --c-warning-border: #fde68a;
+    --c-warning-text: #92400e;
+    --c-go-tag: #00add8;
+    --c-ts-tag: #3178c6;
+    --c-stderr: #e00;
+}
+
+.dark {
+    --c-ink: #ededed;
+    --c-canvas: #171717;
+    --c-canvas-soft: #0a0a0a;
+    --c-hairline: #333;
+    --c-accents-2: #2a2a2a;
+    --c-accents-4: #444;
+    --c-accents-5: #888;
+    --c-accents-6: #999;
+    --c-accents-7: #ccc;
+    --c-success-bg: #0d1b2a;
+    --c-success-border: #1e3a5f;
+    --c-success-text: #58a6ff;
+    --c-error-bg: #1a0d0d;
+    --c-error-border: #5f1e1e;
+    --c-error-text: #ff5858;
+    --c-warning-bg: #1a1400;
+    --c-warning-border: #5f4a00;
+    --c-warning-text: #f0c000;
+    --c-go-tag: #00acc1;
+    --c-ts-tag: #4d9de0;
+    --c-stderr: #ff5858;
+}

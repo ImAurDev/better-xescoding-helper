@@ -22,12 +22,27 @@ const POLL_MS: u64 = 40;
 pub struct Novel {
     pub title: String,
     pub chapters: Vec<Chapter>,
+    pub is_finished: bool,
+    pub prev_url: Option<String>,
+    pub next_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct Chapter {
     pub name: String,
     pub content: String,
+    pub author_message: Option<String>,
+}
+
+fn extract_url(text: &str) -> Option<String> {
+    let s = text.trim();
+    if let Some(start) = s.find('(') {
+        if let Some(end) = s[start..].find(')') {
+            let url = s[start + 1..start + end].trim();
+            if !url.is_empty() { return Some(url.to_string()); }
+        }
+    }
+    None
 }
 
 pub fn parse_novel(code: &str) -> Option<Novel> {
@@ -38,11 +53,32 @@ pub fn parse_novel(code: &str) -> Option<Novel> {
     let mut title = String::new();
     let mut chapters: Vec<Chapter> = Vec::new();
     let mut current: Option<Chapter> = None;
+    let mut is_finished = false;
+    let mut prev_url: Option<String> = None;
+    let mut next_url: Option<String> = None;
     for line in code.lines().skip(1) {
         let trimmed = line.trim();
         if let Some(t) = trimmed.strip_prefix("小说标题:") {
             if title.is_empty() {
                 title = t.trim().to_string();
+            }
+            continue;
+        }
+        if trimmed == "# 全书完" {
+            is_finished = true;
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("# 上一个") {
+            prev_url = extract_url(rest);
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("# 下一个") {
+            next_url = extract_url(rest);
+            continue;
+        }
+        if let Some(msg) = trimmed.strip_prefix("# 作者留言:") {
+            if let Some(ref mut ch) = current {
+                ch.author_message = Some(msg.trim().to_string());
             }
             continue;
         }
@@ -53,6 +89,7 @@ pub fn parse_novel(code: &str) -> Option<Novel> {
             current = Some(Chapter {
                 name: c.trim().to_string(),
                 content: String::new(),
+                author_message: None,
             });
             continue;
         }
@@ -69,7 +106,7 @@ pub fn parse_novel(code: &str) -> Option<Novel> {
     if chapters.is_empty() {
         return None;
     }
-    Some(Novel { title, chapters })
+    Some(Novel { title, chapters, is_finished, prev_url, next_url })
 }
 
 fn trim_chapter(mut ch: Chapter) -> Chapter {
@@ -245,7 +282,130 @@ fn render_too_small(theme: &Theme, cols: usize, rows: usize) -> String {
     s
 }
 
+fn render_chapter_end(tui: &Tui) -> String {
+    let theme = tui.theme;
+    let cols = tui.cols;
+    let rows = tui.rows;
+    let mut s = String::new();
+    s.push_str("\x1b[2J\x1b[H");
+    s.push_str(theme.bg);
+    let chapter = &tui.novel.chapters[tui.chapter_index];
+    let msg = chapter.author_message.as_deref().unwrap_or("");
+    let label = format!("{}  ·  章末寄语", chapter.name);
+    let is_last = tui.chapter_index + 1 >= tui.novel.chapters.len();
+    let hint_text = if is_last && tui.novel.is_finished { "Enter 进入完结页" } else { "Enter 下一章" };
+    let mut lines: Vec<String> = Vec::new();
+    lines.push(String::new());
+    lines.push(label.clone());
+    lines.push(String::new());
+    for line in msg.split('\n') {
+        lines.push(line.to_string());
+    }
+    lines.push(String::new());
+    let total = lines.len() + 2;
+    let top_pad = rows.saturating_sub(total).max(1) / 2;
+    for _ in 0..top_pad {
+        s.push_str(&format!("{}{}{}", theme.bg, " ".repeat(cols), RESET));
+        s.push_str("\r\n");
+    }
+    for line in &lines {
+        let tw = display_width(line);
+        if tw == 0 {
+            s.push_str(&format!("{}{}{}", theme.bg, " ".repeat(cols), RESET));
+        } else if line == &label {
+            s.push_str(&format!("{}{}{}{}", theme.bg, " ".repeat(cols.saturating_sub(tw) / 2), theme.fg_chapter, line));
+            s.push_str(RESET);
+        } else {
+            s.push_str(&format!("{}{}{}{}", theme.bg, " ".repeat(cols.saturating_sub(tw) / 2), theme.fg_body, line));
+            s.push_str(RESET);
+        }
+        s.push_str("\r\n");
+    }
+    s.push_str(&format!("{}{}{}{}", theme.bg, " ".repeat(cols.saturating_sub(display_width(hint_text)) / 2), theme.fg_footer, hint_text));
+    s.push_str(RESET);
+    s.push_str("\r\n");
+    let bottom_pad = rows.saturating_sub(top_pad + total + 1);
+    for _ in 0..bottom_pad {
+        s.push_str(&format!("{}{}{}", theme.bg, " ".repeat(cols), RESET));
+        s.push_str("\r\n");
+    }
+    s.push_str(RESET);
+    s
+}
+
+fn render_end_page(tui: &Tui) -> String {
+    let theme = tui.theme;
+    let cols = tui.cols;
+    let rows = tui.rows;
+    let mut s = String::new();
+    s.push_str("\x1b[2J\x1b[H");
+    s.push_str(theme.bg);
+    let end_text = "全 书 完";
+    let hint_text = "Q 退出  S 主题  Enter翻页";
+    let mut lines: Vec<(bool, bool)> = Vec::new();
+    let mut contents: Vec<String> = Vec::new();
+    contents.push(String::new());
+    lines.push((false, false));
+    contents.push(end_text.to_string());
+    lines.push((true, false));
+    contents.push(String::new());
+    lines.push((false, false));
+    if let Some(ref url) = tui.novel.prev_url {
+        contents.push(format!("\u{25C0} 上一部: {}", url));
+        lines.push((false, true));
+    }
+    if let Some(ref url) = tui.novel.next_url {
+        contents.push(format!("\u{25B6} 下一部: {}", url));
+        lines.push((false, true));
+    }
+    contents.push(String::new());
+    lines.push((false, false));
+    let total_inner = contents.len() + 2;
+    let top_pad = rows.saturating_sub(total_inner).max(1) / 2;
+    for _ in 0..top_pad {
+        s.push_str(&format!("{}{}{}", theme.bg, " ".repeat(cols), RESET));
+        s.push_str("\r\n");
+    }
+    for (i, line) in contents.iter().enumerate() {
+        let text_w = display_width(line);
+        let (is_title, is_link) = lines[i];
+        if text_w == 0 {
+            s.push_str(&format!("{}{}{}", theme.bg, " ".repeat(cols), RESET));
+        } else if is_title {
+            s.push_str(&format!("{}{}{}{}", theme.bg, " ".repeat(cols.saturating_sub(text_w) / 2), theme.fg_title, line));
+            s.push_str(RESET);
+        } else if is_link {
+            s.push_str(&format!("{}{}{}{}", theme.bg, " ".repeat(cols.saturating_sub(text_w) / 2), theme.fg_accent, line));
+            s.push_str(RESET);
+        } else {
+            s.push_str(&format!("{}{}{}{}", theme.bg, " ".repeat(cols.saturating_sub(text_w) / 2), theme.fg_body, line));
+            s.push_str(RESET);
+        }
+        s.push_str("\r\n");
+    }
+    s.push_str(&format!("{}{}{}{}", theme.bg, " ".repeat(cols.saturating_sub(display_width(hint_text)) / 2), theme.fg_footer, hint_text));
+    s.push_str(RESET);
+    s.push_str("\r\n");
+    let bottom_pad = rows.saturating_sub(top_pad + total_inner + 1);
+    for _ in 0..bottom_pad {
+        s.push_str(&format!("{}{}{}", theme.bg, " ".repeat(cols), RESET));
+        s.push_str("\r\n");
+    }
+    s.push_str(RESET);
+    s
+}
+
 fn render_reading(tui: &Tui, wrapped: &[String], chapter_total_pages: usize) -> String {
+    if tui.page + 1 > chapter_total_pages {
+        let chapter = &tui.novel.chapters[tui.chapter_index];
+        if tui.novel.is_finished && tui.chapter_index + 1 >= tui.novel.chapters.len() {
+            return render_end_page(tui);
+        }
+        if chapter.author_message.is_some() {
+            return render_chapter_end(tui);
+        }
+    }
+    let page = tui.page.min(chapter_total_pages.saturating_sub(1));
     let theme = tui.theme;
     let cols = tui.cols;
     let rows = tui.rows;
@@ -274,7 +434,7 @@ fn render_reading(tui: &Tui, wrapped: &[String], chapter_total_pages: usize) -> 
     s.push_str(&format!("{}{}{}{}", theme.bg, theme.fg_rule, "\u{2500}".repeat(cols), RESET));
     s.push_str("\r\n");
 
-    let start = tui.page * content_rows;
+    let start = page * content_rows;
     for i in 0..content_rows {
         let idx = start + i;
         let line = wrapped.get(idx).cloned().unwrap_or_default();
@@ -298,8 +458,7 @@ fn render_reading(tui: &Tui, wrapped: &[String], chapter_total_pages: usize) -> 
     let hints = "Enter/n下一页  b/p上一页  1-9跳章  S主题  Q退出";
     let info_w = display_width(&page_info);
     let hints_w = display_width(hints);
-    let sep = "  ";
-    let sep_w = display_width(sep);
+    let sep_w = display_width("  ");
     if info_w + sep_w + hints_w <= cols {
         s.push_str(&format!("{}{}{}{}{}{}{}", theme.bg, theme.fg_footer, page_info, RESET, theme.bg, " ".repeat(cols - info_w - sep_w - hints_w), RESET));
         s.push_str(&format!("{}{}{}{}", theme.bg, theme.fg_accent, hints, RESET));
@@ -390,13 +549,21 @@ impl Runner {
                 continue;
             }
             let text_width = tui.cols.saturating_sub(8);
-            let content_rows = tui.rows.saturating_sub(6).max(1);
-            let chapter = &tui.novel.chapters[tui.chapter_index];
-            let wrapped = wrap_text(&chapter.content, text_width);
-            let chapter_total_pages = if wrapped.is_empty() { 1 } else { wrapped.len().div_ceil(content_rows) };
-            if tui.page >= chapter_total_pages {
-                tui.page = chapter_total_pages.saturating_sub(1);
-            }
+    let content_rows = tui.rows.saturating_sub(6).max(1);
+    let chapter = &tui.novel.chapters[tui.chapter_index];
+    let wrapped = wrap_text(&chapter.content, text_width);
+    let chapter_total_pages = if wrapped.is_empty() { 1 } else { wrapped.len().div_ceil(content_rows) };
+    let chapter_has_msg = tui.novel.chapters[tui.chapter_index].author_message.is_some();
+    let max_page = if tui.novel.is_finished && tui.chapter_index + 1 >= tui.novel.chapters.len() {
+        chapter_total_pages
+    } else if chapter_has_msg {
+        chapter_total_pages
+    } else {
+        chapter_total_pages.saturating_sub(1)
+    };
+    if tui.page > max_page {
+        tui.page = max_page;
+    }
             tui.chapter_page_counts.clear();
             for c in &tui.novel.chapters {
                 let w = wrap_text(&c.content, text_width);
@@ -438,16 +605,24 @@ impl Runner {
                         if tui.page + 1 < chapter_total_pages {
                             tui.page += 1;
                             page_advanced = true;
+                        } else if tui.page + 1 == chapter_total_pages && tui.novel.chapters[tui.chapter_index].author_message.is_some() {
+                            tui.page += 1;
+                            page_advanced = true;
                         } else if tui.chapter_index + 1 < tui.novel.chapters.len() {
                             tui.chapter_index += 1;
                             tui.page = 0;
+                            page_advanced = true;
+                        } else if tui.novel.is_finished && tui.page + 1 <= chapter_total_pages {
+                            tui.page += 1;
                             page_advanced = true;
                         }
                         if page_advanced { tui.session_pages_read += 1; }
                         break 'input;
                     }
                     if cmd == 'b' || cmd == 'p' || cmd == 'k' || cmd == 'h' {
-                        if tui.page > 0 {
+                        if tui.page >= chapter_total_pages {
+                            tui.page = chapter_total_pages.saturating_sub(1);
+                        } else if tui.page > 0 {
                             tui.page -= 1;
                         } else if tui.chapter_index > 0 {
                             tui.chapter_index -= 1;
@@ -488,7 +663,8 @@ impl Runner {
         tui.progress.total_read_secs += session_secs;
         tui.progress.total_pages_read += tui.session_pages_read;
         tui.progress.chapter_index = tui.chapter_index;
-        tui.progress.page = tui.page;
+        let max_page = tui.chapter_page_counts.get(tui.chapter_index).copied().unwrap_or(1).saturating_sub(1);
+        tui.progress.page = tui.page.min(max_page);
         tui.progress.last_read_at = now_secs();
         let mut store = load_store();
         store.novels.insert(title_key, tui.progress.clone());
@@ -516,7 +692,8 @@ fn save_progress(theme_index: usize) {
 fn save_progress_pos(tui: &Tui) {
     let mut progress = tui.progress.clone();
     progress.chapter_index = tui.chapter_index;
-    progress.page = tui.page;
+    let max_page = tui.chapter_page_counts.get(tui.chapter_index).copied().unwrap_or(1).saturating_sub(1);
+    progress.page = tui.page.min(max_page);
     progress.last_read_at = now_secs();
     let mut store = load_store();
     store.novels.insert(tui.novel.title.clone(), progress);

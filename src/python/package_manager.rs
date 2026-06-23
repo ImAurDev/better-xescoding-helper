@@ -370,8 +370,26 @@ impl PackageManager {
 
     pub async fn handle_search(&self, name: &str) -> Vec<PackageData> {
         let url = format!("https://pypi.org/search/?q={}", urlencoding(name));
-        let html = match reqwest::get(&url).await {
-            Ok(r) => r.text().await.unwrap_or_default(),
+        let html = match crate::utils::retry::retry_async(&crate::utils::retry::RetryPolicy::network(), || async {
+            let r = reqwest::get(&url).await;
+            match r {
+                Ok(resp) if resp.status().is_success() => {
+                    let text = resp.text().await.unwrap_or_default();
+                    Ok(text)
+                }
+                Ok(resp) if crate::utils::retry::is_retryable_status(resp.status().as_u16()) => {
+                    Err(format!("status {}", resp.status()))
+                }
+                Ok(resp) => {
+                    let text = resp.text().await.unwrap_or_default();
+                    Ok(text)
+                }
+                Err(e) => Err(e.to_string()),
+            }
+        })
+        .await
+        {
+            Ok(t) => t,
             Err(e) => {
                 tracing::error!("搜索错误: {e}");
                 return Vec::new();

@@ -6,13 +6,17 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::ChildStdin;
 use tokio::sync::{oneshot, Mutex};
 
+use crate::ai::explain::AiService;
 use crate::config::{asset_path, cache_path};
+use crate::dep_graph;
 use crate::history::{gen_id, now_millis, HistoryStore, RunRecord};
 use crate::python::check_dangerous_code;
 use crate::python::code_blocks::{parse_blocks, parse_go_output, GoOutput};
 use crate::python::config::{find_bun_path, find_golang_path, find_python_path, PYTHON_CANDIDATES};
 use crate::python::exec::{run_with_timeout, warmup_runtimes};
+use crate::python::imports::{auto_install_missing, build_report as build_import_report, classify_against_local, ImportReport};
 use crate::python::package_manager::PackageManager;
+use crate::settings::Settings;
 use crate::utils::cache_cleaner;
 use crate::websocket::webtty::{State, Webtty, WsCmd};
 use crate::websocket::DANGER_CONFIRM_TIMEOUT_SECS;
@@ -34,6 +38,15 @@ pub struct RunnerState {
     pub(crate) python_stdin: Option<Arc<Mutex<Option<ChildStdin>>>>,
     pub(crate) python_kill: Option<oneshot::Sender<()>>,
     pub(crate) golang_kill: Option<oneshot::Sender<()>>,
+    pub(crate) python_pid: Option<u32>,
+    pub(crate) active_python: Option<PathBuf>,
+    pub(crate) current_project_id: Option<String>,
+    pub(crate) last_peak_rss: u64,
+    pub(crate) last_lint_issues: u32,
+    pub(crate) last_auto_installs: u32,
+    pub(crate) last_missing_resolved: u32,
+    pub(crate) last_exit_code: Option<i32>,
+    pub(crate) last_sandboxed: bool,
 }
 
 impl RunnerState {
@@ -55,6 +68,15 @@ impl RunnerState {
             python_stdin: None,
             python_kill: None,
             golang_kill: None,
+            python_pid: None,
+            active_python: None,
+            current_project_id: None,
+            last_peak_rss: 0,
+            last_lint_issues: 0,
+            last_auto_installs: 0,
+            last_missing_resolved: 0,
+            last_exit_code: None,
+            last_sandboxed: false,
         }
     }
 }
@@ -67,6 +89,8 @@ pub struct Runner {
     cache_path: PathBuf,
     pub(crate) state: Arc<Mutex<RunnerState>>,
     last_state: Arc<Mutex<State>>,
+    pub(crate) settings: Arc<Mutex<Settings>>,
+    pub(crate) ai: Arc<AiService>,
 }
 
 impl Runner {
@@ -74,6 +98,8 @@ impl Runner {
         webtty: Arc<Mutex<Webtty>>,
         history: Arc<Mutex<HistoryStore>>,
         pkg_manager: PackageManager,
+        settings: Arc<Mutex<Settings>>,
+        ai: Arc<AiService>,
     ) -> Self {
         Self {
             webtty,
@@ -82,6 +108,8 @@ impl Runner {
             cache_path: cache_path(),
             state: Arc::new(Mutex::new(RunnerState::new())),
             last_state: Arc::new(Mutex::new(State::Wait)),
+            settings,
+            ai,
         }
     }
 
@@ -229,7 +257,19 @@ impl Runner {
             s.run_start_time = now_millis();
             s.run_code = code.clone();
             s.run_has_go_blocks = false;
+            s.current_project_id = Some(path_id.clone());
+            s.last_peak_rss = 0;
+            s.last_lint_issues = 0;
+            s.last_auto_installs = 0;
+            s.last_missing_resolved = 0;
+            s.last_exit_code = None;
+            s.last_sandboxed = false;
+            s.python_pid = None;
+            s.active_python = None;
         }
+
+        let _run_metric_id = crate::python::metrics::begin_run(&path_id, false).await;
+        crate::python::metrics::track_pid(0).await;
 
         if let Some(novel) = super::exec_novel::parse_novel(&code) {
             self.webtty
@@ -240,6 +280,7 @@ impl Runner {
                 })
                 .await;
             self.run_novel(novel).await;
+            let _ = crate::python::metrics::end_run(None, true).await;
             return;
         }
 
@@ -287,6 +328,7 @@ impl Runner {
                     .await;
                 self.webtty.lock().await.send_msg(&WsCmd::CommandRun).await;
                 self.state.lock().await.main_is_running = false;
+                let _ = crate::python::metrics::end_run(None, false).await;
                 return;
             }
             self.webtty
@@ -310,8 +352,13 @@ impl Runner {
                 })
                 .await;
             self.state.lock().await.main_is_running = false;
+            let _ = crate::python::metrics::end_run(None, false).await;
             return;
         }
+
+        let _ = self.analyze_imports(&code).await;
+        let _ = self.run_lint_check(&file_path).await;
+        let _ = self.setup_venv(&path_id).await;
 
         self.detect_python().await;
         let python_path = self.state.lock().await.python_path.clone();
@@ -330,6 +377,7 @@ impl Runner {
             cmd.stderr(std::process::Stdio::piped());
             cmd.env("PYTHONIOENCODING", "utf-8");
             cmd.env("PYTHONUTF8", "1");
+            self.apply_env_to(&mut cmd, &path_id).await;
             for (k, v) in std::env::vars() {
                 cmd.env(k, v);
             }
@@ -360,8 +408,10 @@ impl Runner {
             {
                 let mut s = self.state.lock().await;
                 s.run_output_buffer = filtered.clone();
+                s.last_exit_code = Some(exit_code);
             }
             self.save_run_history(false).await;
+            let _ = crate::python::metrics::end_run(Some(exit_code), false).await;
             let data = format!("\x1b[41;37m[Err] {}\x1b[0m", filtered.replace('\n', "\r\n"));
             self.webtty
                 .lock()
@@ -526,18 +576,232 @@ impl Runner {
     }
 
     pub(crate) async fn save_run_history(&self, success: bool) {
-        let s = self.state.lock().await;
-        let record = RunRecord {
-            id: gen_id(),
-            timestamp: s.run_start_time,
-            code: s.run_code.clone(),
-            output: s.run_output_buffer.trim_end().to_string(),
-            has_go_blocks: s.run_has_go_blocks,
-            success,
-            duration: now_millis() - s.run_start_time,
+        let (record, code, project_id) = {
+            let s = self.state.lock().await;
+            let record = RunRecord {
+                id: gen_id(),
+                timestamp: s.run_start_time,
+                code: s.run_code.clone(),
+                output: s.run_output_buffer.trim_end().to_string(),
+                has_go_blocks: s.run_has_go_blocks,
+                success,
+                duration: now_millis() - s.run_start_time,
+                project_id: s.current_project_id.clone(),
+                peak_rss_bytes: s.last_peak_rss,
+                auto_installs: s.last_auto_installs,
+                lint_issues: s.last_lint_issues,
+                missing_imports_resolved: s.last_missing_resolved,
+                exit_code: s.last_exit_code,
+                env_overrides: None,
+                imports: Vec::new(),
+                packages: Vec::new(),
+                ai_explanation: None,
+                sandboxed: s.last_sandboxed,
+            };
+            (record, s.run_code.clone(), s.current_project_id.clone())
         };
-        drop(s);
+        let imports = dep_graph::extract_top_level_modules(&code);
+        let run_id_for_graph = record.id.clone();
+        let code_for_graph = code.clone();
+        let pkg_manager = self.pkg_manager.clone();
+        let settings = self.settings.clone();
+        let history_for_graph = self.history.clone();
+        let _ = project_id;
         let mut h = self.history.lock().await;
-        h.add(record).await;
+        h.add_with_imports(record.clone(), imports.clone(), Vec::new())
+            .await;
+        drop(h);
+        if !imports.is_empty() {
+            tokio::spawn(async move {
+                let snap = settings.lock().await.clone();
+                let report = dep_graph::build(
+                    &run_id_for_graph,
+                    &code_for_graph,
+                    &pkg_manager,
+                    &snap,
+                )
+                .await;
+                let mut h = history_for_graph.lock().await;
+                h.add_with_imports(
+                    RunRecord {
+                        id: run_id_for_graph.clone(),
+                        timestamp: now_millis(),
+                        code: String::new(),
+                        output: String::new(),
+                        has_go_blocks: false,
+                        success: true,
+                        duration: 0,
+                        project_id: None,
+                        peak_rss_bytes: 0,
+                        auto_installs: 0,
+                        lint_issues: 0,
+                        missing_imports_resolved: 0,
+                        exit_code: None,
+                        env_overrides: None,
+                        imports: report.imports.clone(),
+                        packages: report.packages.clone(),
+                        ai_explanation: None,
+                        sandboxed: false,
+                    },
+                    report.imports,
+                    report.packages,
+                )
+                .await;
+            });
+        }
+        if !success {
+            let ai_enabled = self.settings.lock().await.ai.auto_explain_on_error;
+            if ai_enabled {
+                let ai = self.ai.clone();
+                let history = self.history.clone();
+                let rid = record.id.clone();
+                let code_snapshot = code.clone();
+                let output_snapshot = record.output.clone();
+                tokio::spawn(async move {
+                    let res = ai
+                        .explain_text(&code_snapshot, &output_snapshot)
+                        .await
+                        .ok()
+                        .map(|r| r.explanation);
+                    if let Some(text) = res {
+                        let mut h = history.lock().await;
+                        h.attach_ai_explanation(&rid, &text).await;
+                    }
+                });
+            }
+        }
+    }
+
+    pub(crate) async fn analyze_imports(&self, code: &str) -> Option<ImportReport> {
+        let settings = self.settings.lock().await;
+        if !settings.run_limits.detect_missing_imports {
+            return None;
+        }
+        drop(settings);
+        let mut report = build_import_report(code);
+        if report.install_names.is_empty() {
+            return Some(report);
+        }
+        let local = self.pkg_manager.get_local_list().await;
+        let set: std::collections::HashSet<String> = local
+            .0
+            .iter()
+            .map(|p| p.name.replace('-', "_").to_ascii_lowercase())
+            .collect();
+        let set_normal: std::collections::HashSet<String> =
+            local.0.iter().map(|p| p.name.clone()).collect();
+        let mut combined = set.clone();
+        combined.extend(set_normal);
+        classify_against_local(&mut report, &combined).await;
+        if !report.missing.is_empty() {
+            let _ = auto_install_missing(
+                &report,
+                &self.state.lock().await.python_path,
+                self.webtty.clone(),
+            )
+            .await;
+            crate::python::metrics::record_auto_install(true).await;
+            crate::python::metrics::record_missing_imports_resolved(report.missing.len() as u32)
+                .await;
+            {
+                let mut s = self.state.lock().await;
+                s.last_auto_installs = s.last_auto_installs.saturating_add(report.missing.len() as u32);
+                s.last_missing_resolved = s.last_missing_resolved.saturating_add(report.missing.len() as u32);
+            }
+        }
+        Some(report)
+    }
+
+    pub(crate) async fn run_lint_check(
+        &self,
+        file_path: &Path,
+    ) -> Option<crate::python::lint::LintResult> {
+        let settings = self.settings.lock().await;
+        if !settings.run_limits.lint_before_run {
+            return None;
+        }
+        drop(settings);
+        let result = crate::python::lint::run_lint(file_path, self.webtty.clone(), false).await;
+        if let Some(ref r) = result {
+            if r.available {
+                {
+                    let mut s = self.state.lock().await;
+                    s.last_lint_issues = r.issues.len() as u32;
+                }
+                crate::python::metrics::record_lint(r.issues.len() as u32).await;
+                if !r.issues.is_empty() {
+                    let preview: String = r
+                        .issues
+                        .iter()
+                        .take(5)
+                        .map(|i| format!("L{}: {}", i.line, i.message))
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    let mut wt = self.webtty.lock().await;
+                    wt.send_msg(&WsCmd::BackendEvent {
+                        data: format!(
+                            "\x1b[43;30m[lint-{}] {} 项(展示前 5 条): {}\x1b[0m\r\n",
+                            r.tool,
+                            r.issues.len(),
+                            preview
+                        ),
+                    })
+                    .await;
+                }
+            }
+        }
+        result
+    }
+
+    pub(crate) async fn setup_venv(&self, project_id: &str) -> Option<PathBuf> {
+        let settings_snapshot = self.settings.lock().await.clone();
+        if !settings_snapshot.venv.enabled {
+            return None;
+        }
+        let venv_root =
+            crate::python::venv::ensure_project_venv(project_id, &settings_snapshot, &self.webtty)
+                .await?;
+        let venv_python = crate::python::venv::venv_python(&venv_root);
+        if venv_python.exists() {
+            {
+                let mut s = self.state.lock().await;
+                s.python_path = venv_python.to_string_lossy().to_string();
+                s.active_python = Some(venv_python);
+            }
+        }
+        Some(venv_root)
+    }
+
+    pub(crate) async fn env_overrides_for(
+        &self,
+        project_id: &str,
+    ) -> HashMap<String, String> {
+        let settings = self.settings.lock().await;
+        let mut overrides = HashMap::new();
+        if let Some(map) = settings.env_vars.get(project_id) {
+            for (k, v) in map {
+                overrides.insert(k.clone(), v.clone());
+            }
+        }
+        if let Some(venv) = self.state.lock().await.active_python.as_ref() {
+            if let Some(parent) = venv.parent().and_then(|p| p.parent()) {
+                overrides.insert(
+                    "VIRTUAL_ENV".to_string(),
+                    parent.to_string_lossy().to_string(),
+                );
+            }
+        }
+        if let Some(proxy) = settings.proxy.https.as_ref().or(settings.proxy.http.as_ref()) {
+            overrides.insert("HTTPS_PROXY".to_string(), proxy.clone());
+            overrides.insert("HTTP_PROXY".to_string(), proxy.clone());
+        }
+        overrides
+    }
+
+    pub(crate) async fn apply_env_to(&self, cmd: &mut tokio::process::Command, project_id: &str) {
+        let overrides = self.env_overrides_for(project_id).await;
+        for (k, v) in overrides {
+            cmd.env(k, v);
+        }
     }
 }

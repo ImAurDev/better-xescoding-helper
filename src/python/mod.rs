@@ -6,11 +6,17 @@ pub mod exec_golang;
 pub mod exec_novel;
 pub mod exec_python;
 pub mod exec_typescript;
+pub mod imports;
 pub mod lib_list;
+pub mod lint;
+pub mod metrics;
 pub mod novel_theme;
 pub mod package;
 pub mod package_manager;
+pub mod prewarm;
 pub mod runner;
+pub mod runner_pool;
+pub mod venv;
 
 pub use config::{
     current_bun_path, current_golang_path, current_python_path, find_all_bun_paths,

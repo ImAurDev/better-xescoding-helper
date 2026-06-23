@@ -307,38 +307,49 @@ impl AssetManage {
     }
 
     async fn download_asset_by_url(&self, url: &str) -> Option<Vec<u8>> {
-        let client = reqwest::Client::builder()
-            .http1_only()
-            .user_agent(USER_AGENT)
-            .build()
-            .ok()?;
-        match client
-            .get(url)
-            .header("Accept", "*/*")
-            .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
-            .header("Referer", "https://code.xueersi.com/")
-            .send()
-            .await
-        {
-            Ok(res) => {
-                let status = res.status().as_u16();
-                if status == 200 || status == 304 {
-                    res.bytes().await.ok().map(|b| b.to_vec())
-                } else {
-                    xes_logger(
-                        "download_assets",
-                        &format!("download_asset {url} 失败 {status}"),
-                    );
-                    None
+        let client = crate::settings::build_proxy_client();
+        let result = crate::utils::retry::retry_async(&crate::utils::retry::RetryPolicy::network(), || {
+            let client = client.clone();
+            let url = url.to_string();
+            async move {
+                match client
+                    .get(&url)
+                    .header("Accept", "*/*")
+                    .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+                    .header("Referer", "https://code.xueersi.com/")
+                    .send()
+                    .await
+                {
+                    Ok(res) => {
+                        let status = res.status().as_u16();
+                        if status == 200 || status == 304 {
+                            res.bytes().await.ok().map(|b| b.to_vec()).ok_or_else(|| {
+                                format!("download_asset {url} 读取失败")
+                            })
+                        } else if crate::utils::retry::is_retryable_status(status) {
+                            Err(format!("status {status}"))
+                        } else {
+                            xes_logger(
+                                "download_assets",
+                                &format!("download_asset {url} 失败 {status}"),
+                            );
+                            Err(format!("status {status}"))
+                        }
+                    }
+                    Err(e) => {
+                        xes_logger(
+                            "download_assets",
+                            &format!("download_asset {url} 错误 {}", e),
+                        );
+                        Err(e.to_string())
+                    }
                 }
             }
-            Err(e) => {
-                xes_logger(
-                    "download_assets",
-                    &format!("download_asset {url} 错误 {}", e),
-                );
-                None
-            }
+        })
+        .await;
+        match result {
+            Ok(b) => Some(b),
+            Err(_) => None,
         }
     }
 

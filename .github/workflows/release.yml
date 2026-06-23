@@ -1,0 +1,134 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary: xescoding_helper
+            artifact: xescoding-helper-linux-x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: xescoding_helper.exe
+            artifact: xescoding-helper-windows-x86_64.exe
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            binary: xescoding_helper
+            artifact: xescoding-helper-macos-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            binary: xescoding_helper
+            artifact: xescoding-helper-macos-aarch64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (1.85)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.85"
+          target: ${{ matrix.target }}
+
+      - name: Cache cargo registry & target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.os }}-${{ matrix.target }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ matrix.os }}-${{ matrix.target }}-cargo-release-
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Rename binary
+        shell: bash
+        run: |
+          mv "target/${{ matrix.target }}/release/${{ matrix.binary }}" "${{ matrix.artifact }}"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la artifacts
+
+      - name: Package source code
+        run: |
+          git archive --format=tar.gz --prefix="xescoding-helper-${GITHUB_REF_NAME}/" \
+            -o "artifacts/xescoding-helper-${GITHUB_REF_NAME}-source.tar.gz" HEAD
+          git archive --format=zip --prefix="xescoding-helper-${GITHUB_REF_NAME}/" \
+            -o "artifacts/xescoding-helper-${GITHUB_REF_NAME}-source.zip" HEAD
+
+      - name: Extract release notes from CHANGELOG.md
+        id: changelog
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          NOTES_FILE="release_notes.md"
+          if [ -f CHANGELOG.md ]; then
+            awk -v ver="$VERSION" '
+              /^## \[?[0-9]/ {
+                header=$0
+                gsub(/[^0-9.]/,"",header)
+                if (in_section && header!=ver) exit
+                if (header==ver) { in_section=1; next }
+              }
+              in_section { print }
+            ' CHANGELOG.md > "$NOTES_FILE"
+            if [ -s "$NOTES_FILE" ]; then
+              echo "found=true" >> "$GITHUB_OUTPUT"
+              echo "Extracted release notes for v$VERSION:"
+              cat "$NOTES_FILE"
+            else
+              echo "found=false" >> "$GITHUB_OUTPUT"
+              echo "No CHANGELOG entry for v$VERSION, will use auto-generated notes."
+            fi
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "No CHANGELOG.md found, will use auto-generated notes."
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: ${{ steps.changelog.outputs.found == 'true' && 'release_notes.md' || '' }}
+          generate_release_notes: ${{ steps.changelog.outputs.found != 'true' }}
+          append_body: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: artifacts/*

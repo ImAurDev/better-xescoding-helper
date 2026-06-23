@@ -91,6 +91,14 @@ impl Runner {
         cmd.current_dir(&go_work_dir);
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
+        let project_id = self
+            .state
+            .lock()
+            .await
+            .current_project_id
+            .clone()
+            .unwrap_or_default();
+        self.apply_env_to(&mut cmd, &project_id).await;
         for (k, v) in std::env::vars() {
             cmd.env(k, v);
         }

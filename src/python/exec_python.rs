@@ -7,6 +7,7 @@ use tokio::sync::{oneshot, Mutex};
 use crate::python::code_blocks::module_install_name;
 use crate::python::exec::{forward_stream, is_debug_info, DEFAULT_RUN_TIMEOUT_SECS};
 use crate::python::runner::Runner;
+use crate::sandbox::{backend, report};
 use crate::utils::cache_cleaner;
 use crate::websocket::webtty::WsCmd;
 
@@ -14,6 +15,20 @@ impl Runner {
     pub(super) async fn run_python(&self, file_path: &Path, work_dir: &Path) {
         let mut retry_count = 0u32;
         let max_retries = 1;
+        let project_id = self
+            .state
+            .lock()
+            .await
+            .current_project_id
+            .clone()
+            .unwrap_or_default();
+        let sandbox_cfg = self.settings.lock().await.sandbox.clone();
+        let sandbox_active = sandbox_cfg.enabled
+            && backend::describe(&sandbox_cfg).effective;
+        {
+            let mut s = self.state.lock().await;
+            s.last_sandboxed = sandbox_active;
+        }
         loop {
             self.detect_python().await;
             let python_path = self.state.lock().await.python_path.clone();
@@ -23,17 +38,40 @@ impl Runner {
                 .to_string_lossy()
                 .to_string();
 
-            let mut cmd = tokio::process::Command::new(&python_path);
-            cmd.kill_on_drop(true);
+            let mut cmd = if sandbox_active {
+                match report::prepare(
+                    &python_path,
+                    &sandbox_cfg,
+                    Some(work_dir.to_path_buf()),
+                    &[file_path.to_path_buf()],
+                ) {
+                    Ok(c) => c.inner,
+                    Err(e) => {
+                        tracing::warn!("沙箱准备失败,回退普通执行: {e}");
+                        let mut c = tokio::process::Command::new(&python_path);
+                        c.kill_on_drop(true);
+                        c
+                    }
+                }
+            } else {
+                let mut c = tokio::process::Command::new(&python_path);
+                c.kill_on_drop(true);
+                c
+            };
             cmd.args(["-u", &file_name]);
-            cmd.current_dir(work_dir);
+            if !sandbox_active {
+                cmd.current_dir(work_dir);
+            }
             cmd.stdin(std::process::Stdio::piped());
             cmd.stdout(std::process::Stdio::piped());
             cmd.stderr(std::process::Stdio::piped());
             cmd.env("PYTHONIOENCODING", "utf-8");
             cmd.env("PYTHONUTF8", "1");
-            for (k, v) in std::env::vars() {
-                cmd.env(k, v);
+            if !sandbox_active {
+                self.apply_env_to(&mut cmd, &project_id).await;
+                for (k, v) in std::env::vars() {
+                    cmd.env(k, v);
+                }
             }
 
             let mut child = match cmd.spawn() {
@@ -41,6 +79,7 @@ impl Runner {
                 Err(e) => {
                     tracing::error!("Python启动失败: {e}");
                     self.save_run_history(false).await;
+                    let _ = crate::python::metrics::end_run(None, false).await;
                     self.webtty
                         .lock()
                         .await
@@ -54,6 +93,13 @@ impl Runner {
                     return;
                 }
             };
+            {
+                let mut s = self.state.lock().await;
+                s.python_pid = child.id();
+            }
+            if let Some(pid) = child.id() {
+                crate::python::metrics::track_pid(pid).await;
+            }
 
             let stdout = child.stdout.take();
             let stderr = child.stderr.take();
@@ -194,10 +240,12 @@ impl Runner {
 
             if status.is_err() {
                 self.save_run_history(false).await;
+                let _ = crate::python::metrics::end_run(None, false).await;
                 self.webtty.lock().await.send_msg(&WsCmd::CommandRun).await;
                 let mut s = self.state.lock().await;
                 s.main_is_running = false;
                 s.process_ready = false;
+                s.python_pid = None;
                 return;
             }
 
@@ -235,6 +283,11 @@ impl Runner {
                         .await;
 
                     let install_ok = self.auto_install_module(&install_name).await;
+                    crate::python::metrics::record_auto_install(install_ok).await;
+                    {
+                        let mut s = self.state.lock().await;
+                        s.last_auto_installs = s.last_auto_installs.saturating_add(1);
+                    }
                     if install_ok {
                         self.webtty
                             .lock()
@@ -264,7 +317,13 @@ impl Runner {
                 }
             }
 
-            self.save_run_history(true).await;
+            {
+                let mut s = self.state.lock().await;
+                s.last_exit_code = Some(exit_code);
+                s.python_pid = None;
+            }
+            self.save_run_history(exit_code == 0).await;
+            let _ = crate::python::metrics::end_run(Some(exit_code), exit_code == 0).await;
             self.webtty.lock().await.send_msg(&WsCmd::CommandRun).await;
             let mut s = self.state.lock().await;
             s.main_is_running = false;
