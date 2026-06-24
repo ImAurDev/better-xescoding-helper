@@ -8,8 +8,24 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  create-release:
+    name: Create draft release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create draft GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --draft \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            --prerelease=${{ contains(github.ref_name, '-') }}
+
   build:
     name: Build ${{ matrix.target }}
+    needs: create-release
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -23,11 +39,11 @@ jobs:
             target: x86_64-pc-windows-msvc
             binary: xescoding_helper.exe
             artifact: xescoding-helper-windows-x86_64.exe
-          - os: macos-latest
+          - os: macos-13
             target: x86_64-apple-darwin
             binary: xescoding_helper
             artifact: xescoding-helper-macos-x86_64
-          - os: macos-latest
+          - os: macos-14
             target: aarch64-apple-darwin
             binary: xescoding_helper
             artifact: xescoding-helper-macos-aarch64
@@ -35,13 +51,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain (1.85)
+      - name: Install Linux build deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config
+
+      - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.85"
+          toolchain: stable
           target: ${{ matrix.target }}
 
-      - name: Cache cargo registry & target
+      - name: Cache cargo
         uses: actions/cache@v4
         with:
           path: |
@@ -54,81 +76,49 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }}
 
-      - name: Rename binary
+      - name: Stage binary
         shell: bash
         run: |
-          mv "target/${{ matrix.target }}/release/${{ matrix.binary }}" "${{ matrix.artifact }}"
+          mkdir -p build
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "build/${{ matrix.artifact }}"
+          ls -la build
 
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}
-          if-no-files-found: error
+      - name: Upload binary to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "$GITHUB_REF_NAME" "build/${{ matrix.artifact }}" --clobber
 
-  release:
-    name: Publish GitHub Release
+  attach-sources:
+    name: Attach source archives
     needs: build
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-          merge-multiple: true
-
-      - name: List artifacts
-        run: ls -la artifacts
-
-      - name: Package source code
+      - name: Create source archives
         run: |
           git archive --format=tar.gz --prefix="xescoding-helper-${GITHUB_REF_NAME}/" \
-            -o "artifacts/xescoding-helper-${GITHUB_REF_NAME}-source.tar.gz" HEAD
+            -o "xescoding-helper-${GITHUB_REF_NAME}-source.tar.gz" HEAD
           git archive --format=zip --prefix="xescoding-helper-${GITHUB_REF_NAME}/" \
-            -o "artifacts/xescoding-helper-${GITHUB_REF_NAME}-source.zip" HEAD
+            -o "xescoding-helper-${GITHUB_REF_NAME}-source.zip" HEAD
+          ls -la *.tar.gz *.zip
 
-      - name: Extract release notes from CHANGELOG.md
-        id: changelog
-        shell: bash
+      - name: Upload source archives
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          NOTES_FILE="release_notes.md"
-          if [ -f CHANGELOG.md ]; then
-            awk -v ver="$VERSION" '
-              /^## \[?[0-9]/ {
-                header=$0
-                gsub(/[^0-9.]/,"",header)
-                if (in_section && header!=ver) exit
-                if (header==ver) { in_section=1; next }
-              }
-              in_section { print }
-            ' CHANGELOG.md > "$NOTES_FILE"
-            if [ -s "$NOTES_FILE" ]; then
-              echo "found=true" >> "$GITHUB_OUTPUT"
-              echo "Extracted release notes for v$VERSION:"
-              cat "$NOTES_FILE"
-            else
-              echo "found=false" >> "$GITHUB_OUTPUT"
-              echo "No CHANGELOG entry for v$VERSION, will use auto-generated notes."
-            fi
-          else
-            echo "found=false" >> "$GITHUB_OUTPUT"
-            echo "No CHANGELOG.md found, will use auto-generated notes."
-          fi
+          gh release upload "$GITHUB_REF_NAME" \
+            "xescoding-helper-${GITHUB_REF_NAME}-source.tar.gz" \
+            "xescoding-helper-${GITHUB_REF_NAME}-source.zip" --clobber
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          body_path: ${{ steps.changelog.outputs.found == 'true' && 'release_notes.md' || '' }}
-          generate_release_notes: ${{ steps.changelog.outputs.found != 'true' }}
-          append_body: true
-          draft: false
-          prerelease: ${{ contains(github.ref_name, '-') }}
-          files: artifacts/*
+  publish:
+    name: Publish release
+    needs: attach-sources
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false

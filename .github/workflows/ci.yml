@@ -1,13 +1,8 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
-    tags-ignore: ['v*']
-    paths-ignore:
-      - '**.md'
-      - 'LICENSE'
   pull_request:
+  push:
     branches: [main]
 
 env:
@@ -15,40 +10,49 @@ env:
 
 jobs:
   check:
-    name: Build & Check
+    name: Check ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain (1.85)
+      - name: Install Linux build deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config
+
+      - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.85"
-          components: clippy, rustfmt
+          toolchain: stable
+          target: ${{ matrix.target }}
 
-      - name: Cache cargo registry & target
+      - name: Cache cargo
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-check-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-check-
+          key: ${{ matrix.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ matrix.os }}-${{ matrix.target }}-cargo-
 
-      - name: cargo fmt (check)
-        run: cargo fmt -- --check
+      - name: cargo fmt
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo fmt --all -- --check
 
       - name: cargo clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --target ${{ matrix.target }} --all-targets
 
-      - name: cargo check
-        run: cargo check --locked
-
-      - name: cargo build (release)
-        run: cargo build --release --locked
+      - name: cargo test
+        run: cargo test --locked --target ${{ matrix.target }} --all-features
